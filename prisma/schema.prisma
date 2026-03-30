@@ -1,0 +1,405 @@
+// server/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+}
+
+// --- ENUMS ---
+
+enum Role {
+  SUPERADMIN
+  RECEPTIONIST
+  COIFFEUR
+  ONGLERIE
+  ESTHETICIENNE
+}
+
+enum AppointmentStatus {
+  CONFIRME
+  EN_COURS
+  TERMINE
+  ANNULE
+  NO_SHOW
+}
+
+enum PaymentMethod {
+  ESPECES
+  CB
+  CHEQUE
+  VIREMENT
+  AUTRE
+}
+
+enum ItemType {
+  SERVICE
+  PRODUIT
+}
+
+// --- MODÈLES ---
+
+model User {
+  id             Int            @id @default(autoincrement())
+  email          String         @unique
+  password_hash  String
+  
+  // MODIFICATION : Tableau de rôles pour le multi-rôle
+  roles          Role[]         
+  
+  specialization String?
+  color          String?        @default("#3b82f6")
+  nom            String
+  prenom         String
+  created_at     DateTime       @default(now())
+  last_login     DateTime?
+  isActive       Boolean        @default(true)
+
+  appointments   Appointment[]
+  activity_logs  ActivityLog[]
+  schedules      UserSchedule[]
+  sales_made     Transaction[]  @relation("UserSales")
+
+  @@map("users")
+}
+
+model UserSchedule {
+  id        Int     @id @default(autoincrement())
+  user_id   Int
+  day       Int
+  startTime String  @default("09:00")
+  endTime   String  @default("18:00")
+  isWorking Boolean @default(true)
+  user      User    @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, day])
+  @@map("user_schedules")
+}
+
+model Client {
+  id              Int       @id @default(autoincrement())
+  nom             String
+  prenom          String
+  tel_principal   String?
+  tel_secondaire  String?
+  email           String?
+
+  date_naissance  DateTime?
+  photo_url       String?
+  source          String?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  appointments       Appointment[]
+  coloration_notes   ColorationNote[]
+  coloration_history ColorationHistory[]
+  transactions       Transaction[]
+  fiche_technique    FicheTechnique?
+
+  @@map("clients")
+}
+
+model Service {
+  id                Int               @id @default(autoincrement())
+  nom               String
+  description       String?
+  duree             Int
+  duree_buffer      Int               @default(0)
+  category          String            @default("Coiffage")
+  is_starting_price Boolean           @default(false)
+  prix              Decimal
+  couleur           String?
+  actif             Boolean           @default(true)
+  created_at        DateTime          @default(now())
+
+  // MODIFICATION : Relation N à N (plusieurs services par RDV)
+  appointments      Appointment[]     
+  transaction_items TransactionItem[]
+
+  @@map("services")
+}
+
+model Appointment {
+  id             Int               @id @default(autoincrement())
+  client_id      Int
+  user_id        Int?
+
+  // MODIFICATION : Un rendez-vous peut maintenant avoir plusieurs services
+  services       Service[]         
+
+  date           DateTime
+  heure_debut    DateTime
+  heure_fin      DateTime
+  statut         AppointmentStatus @default(CONFIRME)
+  prix           Decimal
+  notes_internes String?
+  created_at     DateTime          @default(now())
+  updated_at     DateTime          @updatedAt
+  reminder_sent  Boolean           @default(false)
+
+  user           User?             @relation(fields: [user_id], references: [id])
+  client         Client            @relation(fields: [client_id], references: [id])
+  
+  transaction    Transaction?
+  history        ColorationHistory[]
+
+  @@map("appointments")
+}
+
+// --- LE RESTE DES MODÈLES (Transaction, Expense, etc.) reste identique à ton fichier d'origine ---
+
+model Transaction {
+  id             Int      @id @default(autoincrement())
+  created_at     DateTime @default(now())
+  amount         Decimal
+  type           String   
+  payment_method PaymentMethod?
+  client_id      Int?
+  category       String?
+  client_name    String?  
+  user_id        Int?     
+  appointment_id Int?     @unique
+  expense_id     Int?     @unique
+  client         Client?      @relation(fields: [client_id], references: [id])
+  user           User?        @relation("UserSales", fields: [user_id], references: [id])
+  appointment    Appointment? @relation(fields: [appointment_id], references: [id])
+  expense        Expense?     @relation(fields: [expense_id], references: [id])
+  items          TransactionItem[]
+  description    String?
+  @@map("transactions")
+}
+
+model TransactionItem {
+  id             Int      @id @default(autoincrement())
+  transaction_id Int
+  type           ItemType
+  service_id     Int?
+  product_id     Int?
+  quantity       Int      @default(1)
+  price          Decimal
+  name           String
+  transaction    Transaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  service        Service?    @relation(fields: [service_id], references: [id])
+  product        Product?    @relation(fields: [product_id], references: [id])
+  @@map("transaction_items")
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())
+  nom         String
+  description String?
+  prix        Decimal
+  stock       Int      @default(0)
+  marque      String?
+  actif       Boolean  @default(true)
+  created_at  DateTime @default(now())
+  transaction_items TransactionItem[]
+  @@map("products")
+}
+
+model Expense {
+  id          Int      @id @default(autoincrement())
+  amount      Decimal
+  category    String
+  description String?
+  date        DateTime @default(now())
+  supplier_id Int?
+  supplier    Supplier? @relation(fields: [supplier_id], references: [id])
+  transaction Transaction?
+  @@map("expenses")
+}
+
+model Supplier {
+  id          Int      @id @default(autoincrement())
+  name        String
+  contactName String?
+  phone       String?
+  email       String?
+  category    String?
+  notes       String?
+  created_at  DateTime @default(now())
+  expenses    Expense[]
+  @@map("suppliers")
+}
+
+model ColorationNote {
+  id                 Int      @id @default(autoincrement())
+  client_id          Int      @unique
+  type_coloration    String?
+  formule            String?
+  num_couleur        String?
+  oxydant_pct        String?
+  temps_pause        String?
+  allergies          String?
+  sensibilite_cuir   String?
+  contre_indications String?
+  marques_preferees  String?
+  notes_libres       String?
+  technique_appliquee String?
+  produits_a_eviter   String?
+  updated_at         DateTime @updatedAt
+  client             Client @relation(fields: [client_id], references: [id])
+  @@map("coloration_notes")
+}
+
+model ColorationHistory {
+  id                Int      @id @default(autoincrement())
+  client_id         Int
+  appointment_id    Int
+  date_coloration   DateTime @default(now())
+  couleur_appliquee String?
+  formule_utilisee  String?
+  photo_avant_url   String?
+  photo_apres_url   String?
+  resultat          String?
+  created_at        DateTime @default(now())
+  client      Client      @relation(fields: [client_id], references: [id])
+  appointment Appointment @relation(fields: [appointment_id], references: [id])
+  @@map("coloration_history")
+}
+
+model OnlineBooking {
+  id                Int      @id @default(autoincrement())
+  nom               String
+  prenom            String
+  tel               String
+  email             String
+  service_souhaite  String
+  date_souhaitee    DateTime
+  heure_souhaitee   String
+  commentaires      String?
+  statut            String   @default("NOUVELLE")
+  created_at        DateTime @default(now())
+  processed_at      DateTime?
+  @@map("online_bookings")
+}
+
+model Setting {
+  key   String @id
+  value Json
+}
+
+model OpeningHour {
+  id             Int     @id @default(autoincrement())
+  day            Int     @unique // 0-6
+  morningOpen    String  @default("10:00")
+  morningClose   String  @default("13:00")
+  afternoonOpen  String  @default("14:00")
+  afternoonClose String  @default("20:00")
+  isOpen         Boolean @default(true)
+}
+
+model ActivityLog {
+  id        Int      @id @default(autoincrement())
+  user_id   Int?     
+  action    String   
+  details   String?  
+  created_at DateTime @default(now())
+  user      User?    @relation(fields: [user_id], references: [id])
+  @@map("activity_logs")
+}
+
+model Exception {
+  id          Int      @id @default(autoincrement())
+  date        DateTime @unique
+  isOpen      Boolean  @default(false)
+  description String?
+  @@map("exceptions")
+}
+
+
+model FicheTechnique {
+  id        Int      @id @default(autoincrement())
+  client_id Int      @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  statut_client StatutClient?
+  type_cheveux        TypeCheveux?
+  epaisseur           EpaisseurCheveux?
+  densite             DensiteCheveux?
+  cuir_chevelu        CuirChevelu?
+  longueur            LongueurCheveux?
+  longueur_racines_cm String?
+  porosite            PorositeCheveux?
+  elasticite          ElasticiteCheveux?
+  historique_chimique String?
+  problemes_constates String?
+  style_souhaite     String?
+  couleur_desiree    String? @db.Text
+  couleur_appliquee  String? @db.Text
+  evenement_particulier String?
+  test_meche        Boolean?
+  resultat_test     TestMecheResultat?
+  produits_recommandes String? @db.Text
+  temps_pose_estime String?
+  precautions       String? @db.Text
+  service_prevu        String? @db.Text
+  duree_estimee_h      String?
+  produits_utilises    String? @db.Text
+  resultat_obtenu      String? @db.Text
+  conseils_post_service String? @db.Text
+  prochain_rdv_conseille String?
+  remarques String? @db.Text
+  client Client @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  @@map("fiches_techniques")
+}
+
+enum StatutClient {
+  PREMIERE_VISITE
+  FIDELE
+  OCCASIONNELLE
+}
+
+enum TypeCheveux {
+  RAIDES
+  ONDULES
+  BOUCLES
+  CREPUS
+}
+
+enum EpaisseurCheveux {
+  FINS
+  MOYENS
+  EPAIS
+}
+
+enum DensiteCheveux {
+  FAIBLE
+  MOYENNE
+  FORTE
+}
+
+enum CuirChevelu {
+  NORMAL
+  SEC
+  GRAS
+  PELLICULES
+  SENSIBLE
+}
+
+enum LongueurCheveux {
+  COURT
+  MI_LONG
+  LONG
+}
+
+enum PorositeCheveux {
+  FAIBLE
+  MOYENNE
+  FORTE
+}
+
+enum ElasticiteCheveux {
+  BONNE
+  MOYENNE
+  FAIBLE
+}
+
+enum TestMecheResultat {
+  RESISTANT
+  FRAGILE
+  REACTION_ANORMALE
+}
