@@ -32,9 +32,6 @@ app.use(cors({
     if (
       origin.includes('localhost') ||
       origin.includes('vercel.app') ||
-      origin.includes('onrender.com') ||
-      origin.includes('railway.app') ||
-      origin.includes('hostinger.com') ||
       origin.includes('hostingersite.com') ||
       (process.env.CORS_ORIGIN && origin === process.env.CORS_ORIGIN)
     ) {
