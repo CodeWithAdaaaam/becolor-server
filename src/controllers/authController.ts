@@ -90,7 +90,7 @@ export const login = async (req: Request, res: Response) => {
     const token = jwt.sign(
       { userId: user.id, roles: user.roles }, // Token inclut le tableau des rôles
       JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '30d' }
     );
 
     res.json({ 
