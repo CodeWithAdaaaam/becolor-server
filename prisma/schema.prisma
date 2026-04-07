@@ -86,7 +86,7 @@ model Client {
   tel_principal   String?
   tel_secondaire  String?
   email           String?
-
+  notes_techniques  String?
   date_naissance  DateTime?
   photo_url       String?
   source          String?

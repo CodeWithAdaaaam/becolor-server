@@ -1,47 +1,94 @@
 // server/src/controllers/appointmentController.ts
 import { Request, Response } from 'express';
-import { PrismaClient, Prisma } from '@prisma/client'; // Import de Prisma pour les types Decimal
+import { PrismaClient, Prisma } from '@prisma/client'; 
 import { logActivity } from '../services/logger';
 import { sendMessage } from '../services/whatsappClient';
 
 const prisma = new PrismaClient();
 
 // ============================================================
-// FONCTION : VÉRIFIE HORAIRES + CONFLITS
+// FONCTION : VÉRIFIE HORAIRES + CONFLITS (AMÉLIORÉE)
 // ============================================================
-const checkAvailability = async (userId: number, start: Date, end: Date, excludeAppointmentId?: number): Promise<string | null> => {
+const checkAvailability = async (
+  userId: number, 
+  start: Date, 
+  end: Date, 
+  excludeAppointmentId?: number,
+  db: any = prisma // FIX: Permet d'utiliser la transaction en cours
+): Promise<string | null> => {
   if (!userId) return null;
 
   const dayOfWeek = start.getDay();
-  const schedule = await prisma.userSchedule.findUnique({ 
+
+  // 1. RÉCUPÉRER LES HORAIRES DU MAGASIN (Double Session)
+  const storeHours = await db.openingHour.findUnique({ 
+    where: { day: dayOfWeek } 
+  });
+
+  if (!storeHours || !storeHours.isOpen) {
+    return "Le salon est fermé ce jour-là.";
+  }
+
+  const getMin = (time: string) => {
+    const [h, m] = time.split(':').map(Number);
+    return h * 60 + m;
+  };
+
+  const startMin = start.getHours() * 60 + start.getMinutes();
+  const endMin = end.getHours() * 60 + end.getMinutes();
+
+  const mOpen = getMin(storeHours.morningOpen);
+  const mClose = getMin(storeHours.morningClose);
+  const aOpen = getMin(storeHours.afternoonOpen);
+  const aClose = getMin(storeHours.afternoonClose);
+
+  // Vérification des sessions
+  const isInMorning = startMin >= mOpen && endMin <= mClose;
+  const isOvernight = aClose < aOpen;
+  const isInAfternoon = isOvernight
+    ? (startMin >= aOpen || startMin < aClose)
+    : (startMin >= aOpen && endMin <= aClose);
+
+  if (!isInMorning && !isInAfternoon) {
+    if (startMin < mClose && endMin > aOpen) {
+      return "Le rendez-vous chevauche la pause déjeuner.";
+    }
+    return "En dehors des horaires d'ouverture.";
+  }
+
+  // 2. VÉRIFIER LE PLANNING PERSONNEL DE L'EMPLOYÉ
+  const staffSchedule = await db.userSchedule.findUnique({ 
     where: { user_id_day: { user_id: userId, day: dayOfWeek } } 
   });
 
-  if (schedule) {
-    if (!schedule.isWorking) return "L'employé ne travaille pas ce jour-là (Repos).";
-    const [startHour, startMin] = schedule.startTime.split(':').map(Number);
-    const [endHour, endMin] = schedule.endTime.split(':').map(Number);
-    
-    const workStart = new Date(start); workStart.setHours(startHour, startMin, 0, 0);
-    const workEnd = new Date(start); workEnd.setHours(endHour, endMin, 0, 0);
-    
-    if (start < workStart || end > workEnd) {
-        return `L'employé travaille uniquement de ${schedule.startTime} à ${schedule.endTime}.`;
-    }
+  if (staffSchedule && !staffSchedule.isWorking) {
+    return "L'employé est en repos ce jour-là.";
   }
 
-  const conflict = await prisma.appointment.findFirst({
+  // 3. VÉRIFIER LES CONFLITS (FIX 409 : Exclusion correcte de l'ID)
+  console.log(`[DEBUG] Vérification dispo pour user ${userId} | Exclusion ID: ${excludeAppointmentId}`);
+  console.log(`[DEBUG] Période demandée : De ${start.toLocaleString()} à ${end.toLocaleString()}`);
+
+  const conflict = await db.appointment.findFirst({
     where: {
       user_id: userId,
-      id: excludeAppointmentId ? { not: excludeAppointmentId } : undefined,
       statut: { not: 'ANNULE' },
-      AND: [ { heure_debut: { lt: end } }, { heure_fin: { gt: start } } ]
+      id: excludeAppointmentId ? { not: excludeAppointmentId } : undefined,
+      AND:[ 
+        { heure_debut: { lt: end } }, 
+        { heure_fin: { gt: start } } 
+      ]
     }
   });
 
-  if (conflict) return "Ce créneau est déjà pris par un autre rendez-vous.";
+  if (conflict) {
+    console.warn(`[ATTENTION] Conflit détecté avec le RDV existant ID: ${conflict.id}`);
+    // On renvoie l'ID dans le message pour le voir directement sur le frontend !
+    return `Ce créneau est déjà pris par le rendez-vous #${conflict.id}.`;
+  }
+
   return null;
-};
+}
 
 // ============================================================
 // 1. RÉCUPÉRER LES RDV
@@ -52,7 +99,8 @@ export const getAppointments = async (req: Request, res: Response) => {
     if (!start || !end) return res.status(400).json({ message: "Dates requises" });
 
     const whereClause: any = {
-      date: { gte: new Date(start as string), lte: new Date(end as string) },
+      heure_debut: { gte: new Date(start as string) },
+      heure_fin: { lte: new Date(end as string) },
       statut: { not: 'ANNULE' }
     };
 
@@ -64,16 +112,11 @@ export const getAppointments = async (req: Request, res: Response) => {
 
     const appointments = await prisma.appointment.findMany({
       where: whereClause,
-      include: { 
-        client: true, 
-        services: true, 
-        user: true 
-      },
+      include: { client: true, services: true, user: true },
       orderBy: { heure_debut: 'asc' },
     });
     res.json(appointments);
   } catch (error) {
-    console.error("Erreur getAppointments:", error);
     res.status(500).json({ message: "Erreur récupération des RDV" });
   }
 };
@@ -85,13 +128,12 @@ export const createAppointment = async (req: Request, res: Response) => {
   try {
     const { client_id, service_ids, user_id, heure_debut } = req.body;
     
-    if (!user_id) return res.status(400).json({ message: "Prestataire obligatoire." });
-    if (!service_ids || !Array.isArray(service_ids) || service_ids.length === 0) {
-        return res.status(400).json({ message: "Au moins une prestation est requise." });
+    if (!user_id || !service_ids || service_ids.length === 0) {
+        return res.status(400).json({ message: "Données manquantes (prestataire ou services)." });
     }
 
     const selectedServices = await prisma.service.findMany({
-        where: { id: { in: service_ids.map(id => Number(id)) } }
+        where: { id: { in: service_ids.map((id: any) => Number(id)) } }
     });
 
     const totalDuration = selectedServices.reduce((acc, s) => acc + s.duree + (s.duree_buffer || 0), 0);
@@ -100,6 +142,7 @@ export const createAppointment = async (req: Request, res: Response) => {
     const startDate = new Date(heure_debut);
     const endDate = new Date(startDate.getTime() + totalDuration * 60000);
 
+    // Vérification disponibilité (sans ID à exclure car c'est une création)
     const conflictReason = await checkAvailability(Number(user_id), startDate, endDate);
     if (conflictReason) return res.status(409).json({ message: conflictReason }); 
 
@@ -125,7 +168,6 @@ export const createAppointment = async (req: Request, res: Response) => {
         const formattedDate = new Date(startDate).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
         const formattedTime = new Date(startDate).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
         const serviceNames = newAppointment.services.map(s => s.nom).join(', ');
-        
         const message = `🌟 *Confirmation RDV be COLOR*\n\nBonjour ${newAppointment.client.prenom},\nRDV confirmé !\n\n🗓️ *${formattedDate}*\n🕒 *${formattedTime}*\n💅 Prestation(s) : ${serviceNames}\n💰 Total : ${calculatedPrice} MAD\n\nÀ très vite !`;
         sendMessage(newAppointment.client.tel_principal, message);
       }
@@ -138,90 +180,126 @@ export const createAppointment = async (req: Request, res: Response) => {
 };
 
 // ============================================================
-// 3. MISE À JOUR (DASHBOARD + CAISSE)
+// 3. MISE À JOUR (DASHBOARD + CAISSE + DRAG&DROP)
 // ============================================================
 export const updateAppointment = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { heure_debut, user_id, statut, price, service_ids } = req.body;
+  // On accepte 'start' et 'end' au cas où le drag&drop du frontend utilise ces clés
+  const { heure_debut, start, heure_fin, end, user_id, statut, price, service_ids } = req.body;
   const appointmentId = Number(id);
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-        const currentAppt = await tx.appointment.findUnique({ 
-            where: { id: appointmentId }, 
-            include: { services: true, client: true } 
+      const currentAppt = await tx.appointment.findUnique({
+        where: { id: appointmentId },
+        include: { services: true, client: true }
+      });
+
+      if (!currentAppt) throw new Error("Rendez-vous introuvable");
+
+      // 1. Gestion du Drag & Drop : Priorité aux données entrantes
+      const incomingStart = heure_debut || start;
+      const newStart = incomingStart ? new Date(incomingStart) : currentAppt.heure_debut;
+      
+      const providerId = user_id ? Number(user_id) : currentAppt.user_id;
+
+      // Recalcul des services si modifiés
+      let selectedServices = currentAppt.services;
+      if (service_ids && Array.isArray(service_ids)) {
+        selectedServices = await tx.service.findMany({
+          where: { id: { in: service_ids.map((sid: any) => Number(sid)) } }
         });
+      }
 
-        if (!currentAppt) throw new Error("RDV introuvable");
+      // 2. Gestion du Resize (FIX 409) : Si le front envoie une heure de fin manuelle, on l'utilise.
+      // Sinon, on calcule avec la durée des prestations.
+      const incomingEnd = heure_fin || end;
+      let newEnd: Date;
+      if (incomingEnd) {
+        newEnd = new Date(incomingEnd);
+      } else {
+        const totalDuration = selectedServices.reduce((acc, s) => acc + s.duree + (s.duree_buffer || 0), 0);
+        newEnd = new Date(newStart.getTime() + totalDuration * 60000);
+      }
 
-        const newStart = heure_debut ? new Date(heure_debut) : currentAppt.heure_debut;
-        const providerId = user_id ? Number(user_id) : currentAppt.user_id;
+      // FIX : On détermine le statut final AVANT la vérification
+      const finalStatut = statut || currentAppt.statut;
 
-        // Gestion des services si fournis
-        let newServices = currentAppt.services;
-        if (service_ids && Array.isArray(service_ids)) {
-             newServices = await tx.service.findMany({
-                 where: { id: { in: service_ids.map((s: any) => Number(s)) } }
-             });
-        }
+      // Vérification disponibilité (On NE VÉRIFIE PAS si le RDV est en cours d'annulation)
+      // FIX TIMEOUT: On passe `tx` ici !
+      if (providerId && finalStatut !== 'ANNULE') {
+          const conflictReason = await checkAvailability(providerId, newStart, newEnd, appointmentId, tx);
+          if (conflictReason) {
+              const err = new Error(conflictReason);
+              (err as any).statusCode = 409;
+              throw err;
+          }
+      }
 
-        const totalDuration = newServices.reduce((acc, s) => acc + s.duree + (s.duree_buffer || 0), 0);
-        const newEnd = new Date(newStart.getTime() + totalDuration * 60000);
+      // Calcul du prix
+      let finalPrice = currentAppt.prix;
+      if (price !== undefined) {
+          finalPrice = new Prisma.Decimal(price);
+      } else if (service_ids) {
+          const total = selectedServices.reduce((acc, s) => acc + Number(s.prix), 0);
+          finalPrice = new Prisma.Decimal(total);
+      }
 
-        if (heure_debut || (user_id && user_id !== currentAppt.user_id)) {
-            if (providerId) { 
-                const conflictReason = await checkAvailability(providerId, newStart, newEnd, appointmentId);
-                if (conflictReason) throw new Error(conflictReason);
+      const updated = await tx.appointment.update({
+        where: { id: appointmentId },
+        data: {
+          heure_debut: newStart,
+          heure_fin: newEnd,
+          user_id: providerId,
+          statut: finalStatut, // On utilise la variable ici
+          date: newStart,
+          prix: finalPrice,
+          services: service_ids ? {
+            set: service_ids.map((sid: any) => ({ id: Number(sid) }))
+          } : undefined
+        },
+        include: { user: true, client: true, services: true }
+      });
+
+      // 3. Encaissement auto (FIX 500 : Empêcher le doublon de transaction)
+      if (finalStatut === 'TERMINE') {
+        const existingTx = await tx.transaction.findFirst({
+          where: { appointment_id: updated.id }
+        });
+        
+        if (!existingTx) {
+          await tx.transaction.create({
+            data: {
+              amount: finalPrice,
+              type: 'ENTREE',
+              category: 'PRESTATION',
+              description: `RDV: ${updated.client.prenom}`,
+              appointment_id: updated.id
             }
+          });
+        } else if (price !== undefined) {
+          // (Optionnel) Si on modifie le prix d'un RDV déjà terminé, on met à jour la transaction
+          await tx.transaction.update({
+            where: { id: existingTx.id },
+            data: { amount: finalPrice }
+          });
         }
+      }
 
-        // Prix final (saisie manuelle ou calcul auto)
-        let finalPrice = Number(currentAppt.prix);
-        if (price !== undefined) {
-            finalPrice = Number(price);
-        } else if (service_ids) {
-            finalPrice = newServices.reduce((acc, s) => acc + Number(s.prix), 0);
-        }
-
-        const updatedAppointment = await tx.appointment.update({
-            where: { id: appointmentId },
-            data: { 
-                heure_debut: newStart, 
-                heure_fin: newEnd, 
-                user_id: providerId, 
-                statut: statut || currentAppt.statut, 
-                date: newStart,
-                prix: new Prisma.Decimal(finalPrice),
-                services: service_ids ? {
-                    set: newServices.map(s => ({ id: s.id }))
-                } : undefined
-            },
-            include: { user: true, client: true, services: true }
-        });
-
-        // ENCAISSEMENT : Création de la transaction
-        if (statut === 'TERMINE') {
-            await tx.transaction.create({
-                data: {
-                    amount: new Prisma.Decimal(finalPrice),
-                    type: 'ENTREE',
-                    category: 'PRESTATION',
-                    description: `Encaissement RDV: ${updatedAppointment.client.prenom}`,
-                    appointment_id: updatedAppointment.id
-                }
-            });
-        }
-
-        return updatedAppointment;
+      return updated;
+    }, {
+      maxWait: 5000, // temps max pour se connecter
+      timeout: 10000 // temps max pour exécuter la transaction (10s)
     });
-    
-    res.json(result);
 
+    res.json(result);
   } catch (error: any) {
-    if (error.message && (error.message.includes("conflit") || error.message.includes("déjà pris"))) {
+    if (error.statusCode === 409) {
         return res.status(409).json({ message: error.message });
     }
-    res.status(500).json({ message: "Erreur mise à jour" });
+    // J'ajoute un console.error pour que tu voies l'erreur exacte dans tes logs Hostinger si la 500 revient
+    console.error("Erreur serveur UpdateAppointment :", error);
+    res.status(500).json({ message: "Erreur serveur lors de la mise à jour." });
   }
 };
 
@@ -241,7 +319,7 @@ export const deleteAppointment = async (req: Request, res: Response) => {
 };
 
 // ============================================================
-// 5. LISTE COMPLÈTE (PAGINÉE)
+// 5. LISTE COMPLÈTE (DASHBOARD)
 // ============================================================
 export const getAppointmentsList = async (req: Request, res: Response) => {
   try {
@@ -252,7 +330,7 @@ export const getAppointmentsList = async (req: Request, res: Response) => {
     const skip = (page - 1) * limit;
 
     const whereClause: any = {
-      OR: [
+      OR:[
         { client: { nom: { contains: search, mode: 'insensitive' } } },
         { client: { prenom: { contains: search, mode: 'insensitive' } } },
       ],

@@ -101,53 +101,51 @@ export const saveAppointmentHistory = async (req: Request, res: Response) => {
 };
 
 // 3. CRÉER UN CLIENT
-export const createClient = async (req: Request, res: Response) => {
-  try {
-    const { nom, prenom, tel_principal, email } = req.body;
-    
-    // Si le numéro existe déjà, on ajoute un suffixe unique
-    let telToUse = tel_principal;
-    const existing = await prisma.client.findFirst({ where: { tel_principal } });
-    if (existing) {
-      const timestamp = Date.now().toString().slice(-4);
-      telToUse = `${tel_principal}_${timestamp}`;
-    }
 
-    const newClient = await prisma.client.create({
-      data: { 
-        nom, 
-        prenom, 
-        tel_principal: telToUse,
-        tel_secondaire: existing ? tel_principal : null, // On garde le numéro original en secondaire si doublon
-        email, 
-        source: existing ? 'panel_duplicate' : 'panel' 
-      }
-    });
-    
-    // Création d'une fiche technique vide
-    await prisma.colorationNote.create({ data: { client_id: newClient.id } });
-
-    res.status(201).json(newClient);
-  } catch (error: any) {
-    console.error("Erreur création client:", error);
-    res.status(500).json({ 
-      message: "Erreur création client", 
-      error: error?.message || 'Erreur inconnue' 
-    });
-  }
-};
 
 // 4. METTRE À JOUR LES INFOS GÉNÉRALES (Nom, Tel...)
 export const updateClient = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  
+  // 1. BIEN RÉCUPÉRER 'notes_techniques' depuis le corps de la requête
+  const { nom, prenom, tel_principal, email, notes_techniques } = req.body;
+
   try {
-    const { id } = req.params;
-    const client = await prisma.client.update({
+    const updatedClient = await prisma.client.update({
       where: { id: Number(id) },
-      data: req.body // Met à jour tout ce qui est envoyé (nom, prenom, etc.)
+      data: {
+        nom,
+        prenom,
+        tel_principal,
+        email,
+        // 2. BIEN L'AJOUTER ICI POUR PRISMA
+        notes_techniques: notes_techniques 
+      }
     });
-    res.json(client);
+
+    res.json(updatedClient);
   } catch (error) {
-    res.status(500).json({ message: "Erreur mise à jour client" });
+    console.error("Erreur mise à jour client:", error);
+    res.status(500).json({ message: "Erreur lors de la sauvegarde" });
+  }
+};
+
+// FAITES LA MÊME CHOSE POUR LA FONCTION createClient
+export const createClient = async (req: Request, res: Response) => {
+  const { nom, prenom, tel_principal, email, notes_techniques } = req.body;
+  try {
+    const newClient = await prisma.client.create({
+      data: {
+        nom,
+        prenom,
+        tel_principal,
+        email,
+        notes_techniques // <--- IMPORTANT
+      }
+    });
+    res.status(201).json(newClient);
+  } catch (error) {
+    res.status(500).json({ message: "Erreur création" });
   }
 };
 
